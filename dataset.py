@@ -45,7 +45,7 @@ class CoNLL2003Dataset(Dataset):
         vocab: Dict[str, int],
         max_len: int = 128,
     ):
-        raw = load_dataset("conll2003", trust_remote_code=True)[split]
+        raw = load_dataset("conll2003", revision="refs/convert/parquet")[split]
         self.examples = []
         for ex in raw:
             tokens = ex["tokens"]

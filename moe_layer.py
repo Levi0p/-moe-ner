@@ -66,7 +66,7 @@ class MoELayer(nn.Module):
             out: (batch, seq_len, output_dim)
         """
         B, S, D = x.shape
-        x_flat = x.view(B * S, D)  # (B*S, input_dim)
+        x_flat = x.reshape(B * S, D)  # (B*S, input_dim)
 
         # Gating
         gate_logits = self.gate(x_flat)                          # (B*S, num_experts)
@@ -89,4 +89,4 @@ class MoELayer(nn.Module):
         )                                                         # (B*S, top_k, output_dim)
         out_flat = (top_k_scores_exp * selected).sum(dim=1)      # (B*S, output_dim)
 
-        return out_flat.view(B, S, -1)
+        return out_flat.reshape(B, S, -1)

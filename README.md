@@ -32,32 +32,32 @@ Linear → num_labels (9)
 
 ## Results on CoNLL 2003 (test set)
 
-| Model         | Token Accuracy | Entity F1 |
-|---------------|:--------------:|:---------:|
-| BiLSTM (base) |     ~0.961     |  ~0.783   |
-| BiLSTM + MoE  |     ~0.973     |  ~0.815   |
-| **Δ (MoE)**   |    **+1.2%**   | **+3.2%** |
+| Model         | Test Accuracy | Test F1  |
+|---------------|:-------------:|:--------:|
+| BiLSTM (base) |    0.9406     |  0.7190  |
+| BiLSTM + MoE  |    0.9374     |  0.7289  |
+| **Δ (MoE)**   |  **−0.32 pts** | **+0.99 pts** |
 
-> *Exact numbers vary slightly per run; run `python src/train.py` to reproduce.*
+> Single run, no fixed seed — a mixed result, not a clean win: MoE narrowly improves entity-F1 but not accuracy. Run `python train.py` to reproduce; numbers will vary run to run. An earlier version of this README reported a larger improvement (+1.2%/+3.2%) — that number predates a bug fix to `moe_layer.py` (the MoE forward pass crashed before the fix and was never actually reproducible) and should be disregarded.
 
 ## Setup
 
 ```bash
 # 1. Clone
-git clone https://github.com/<your-username>/moe-ner.git
-cd moe-ner
+git clone https://github.com/Levi0p/-moe-ner.git
+cd -moe-ner
 
 # 2. Install dependencies
 pip install -r requirements.txt
 
 # 3. Train both models and compare
-python src/train.py
+python train.py
 
 # 4. Train only MoE
-python src/train.py --model moe
+python train.py --model moe
 
 # 5. Train only baseline
-python src/train.py --model base
+python train.py --model base
 ```
 
 ### Optional flags
@@ -73,7 +73,7 @@ python src/train.py --model base
 ## Inference
 
 ```bash
-python src/predict.py \
+python predict.py \
   --checkpoint checkpoints/moe_best.pt \
   --text "Sundar Pichai visited New York to meet Microsoft executives."
 ```
@@ -98,14 +98,13 @@ executives.          O
 ## Project Structure
 
 ```
-moe-ner/
-├── src/
-│   ├── moe_layer.py   # MoE layer (Expert + MoELayer classes)
-│   ├── model.py       # BiLSTMNER + BiLSTMMoENER
-│   ├── dataset.py     # CoNLL 2003 loader + vocab builder
-│   ├── train.py       # Training loop + evaluation + comparison
-│   └── predict.py     # Inference on custom text
-├── checkpoints/       # Saved model weights (auto-created)
+-moe-ner/
+├── moe_layer.py   # MoE layer (Expert + MoELayer classes)
+├── model.py       # BiLSTMNER + BiLSTMMoENER
+├── dataset.py     # CoNLL 2003 loader + vocab builder
+├── train.py       # Training loop + evaluation + comparison
+├── predict.py     # Inference on custom text
+├── checkpoints/   # Saved model weights (auto-created)
 ├── requirements.txt
 └── README.md
 ```

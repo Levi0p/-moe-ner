@@ -222,7 +222,7 @@ def main():
     )
 
     print("Loading CoNLL 2003 and building vocabulary …")
-    raw = load_dataset("conll2003", trust_remote_code=True)
+    raw = load_dataset("conll2003", revision="refs/convert/parquet")
     vocab = build_vocab(raw, min_freq=CFG["min_freq"])
     print(f"Vocabulary size: {len(vocab):,}")
 
