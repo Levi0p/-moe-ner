@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+checkpoints/
+glove_vecs.npy
+glove_words.txt
+log*.txt
+nohup.out

@@ -1,123 +1,55 @@
-# Mixture of Experts Layer for Named Entity Recognition
+# Mixture-of-Experts layer for Named Entity Recognition
 
-A custom **Mixture of Experts (MoE)** layer integrated into a **BiLSTM** sequence tagger, evaluated on **CoNLL 2003 NER**.
+A Mixture-of-Experts (MoE) layer implemented from scratch in PyTorch, added to a BiLSTM sequence tagger and evaluated on CoNLL-2003 NER against a plain BiLSTM and a parameter-matched dense-FFN control.
 
-## Architecture
+## Model
 
 ```
-Token IDs
-   │
-   ▼
-Embedding (128-d)
-   │
-   ▼
-BiLSTM × 2 layers  (256-d hidden, bidirectional)
-   │
-   ▼
-MoE Layer ──────────────────────────────────────┐
-│  Gate: Linear → Softmax → Top-K selection     │
-│  Experts: 4 × MLP(256 → 256 → 256)           │
-│  Output: weighted sum of Top-2 expert outputs │
-└────────────────────────────────────────────────┘
-   │ (residual + LayerNorm)
-   ▼
-Linear → num_labels (9)
+word (GloVe 100d, lower-cased) + casing embedding (8d) + char-CNN (50 filters)
+   -> BiLSTM x 2 (512 hidden, packed sequences)
+   -> [optional block, residual + LayerNorm]
+        none : plain BiLSTM baseline
+        ffn  : dense MLP (256 hidden)               <- capacity control
+        moe  : 4 expert MLPs (256 hidden), softmax gate, top-2 routing
+   -> Linear -> 9 BIO labels
 ```
 
-### MoE Layer Details
+MoE details (`moe_layer.py`): learned linear gate -> softmax -> top-2 selection with renormalised weights; each expert is a 2-layer MLP with ReLU and dropout. An optional Switch-style load-balancing loss (`--lb_coef`) is computed over real tokens only (padding excluded), and per-expert routing shares are recorded for analysis.
 
-- **N = 4** expert MLPs, each a 2-layer network with ReLU and Dropout
-- **Top-K = 2** routing: gate scores computed via a learned linear layer + Softmax, top-2 experts selected and re-normalised
-- Residual connection wraps the MoE block: `out = LayerNorm(lstm_out + moe_out)`
+## Results (CoNLL-2003 test, entity-level F1 via seqeval, 3 seeds, 8 epochs)
 
-## Results on CoNLL 2003 (test set)
+| Model | Params | Test F1 (mean ± std) | Test acc |
+|---|---:|:---:|:---:|
+| BiLSTM baseline | 4.78M | **89.42 ± 0.30** | 97.88% |
+| + dense FFN (control) | 5.05M | 88.79 ± 0.55 | 97.75% |
+| + MoE (4 experts, top-2) | 5.84M | 88.39 ± 0.53 | 97.65% |
+| + MoE + load-balancing loss (0.01) | 5.84M | 89.33 ± 0.39 | 97.87% |
 
-| Model         | Test Accuracy | Test F1  |
-|---------------|:-------------:|:--------:|
-| BiLSTM (base) |    0.9406     |  0.7190  |
-| BiLSTM + MoE  |    0.9374     |  0.7289  |
-| **Δ (MoE)**   |  **−0.32 pts** | **+0.99 pts** |
+Per-seed scores are in `results/`. Model selection uses validation F1 only; test F1 is computed once on the best-validation checkpoint.
 
-> Single run, no fixed seed — a mixed result, not a clean win: MoE narrowly improves entity-F1 but not accuracy. Run `python train.py` to reproduce; numbers will vary run to run. An earlier version of this README reported a larger improvement (+1.2%/+3.2%) — that number predates a bug fix to `moe_layer.py` (the MoE forward pass crashed before the fix and was never actually reproducible) and should be disregarded.
+**Findings**
+- MoE with a load-balancing loss matches the baseline (89.33 vs 89.42; the gap is well inside seed-to-seed noise). It does not beat it.
+- Without the balance loss MoE is about 1 F1 worse than the baseline; with it, about 0.9 F1 better. Expert shares then stay in the 17-33% range, so routing does not collapse.
+- Adding a dense FFN of similar size does not help either, so extra capacity alone is not the limiting factor for this tagger.
+- 8 experts with the balance loss (seed 0 only) scored 89.73 against 89.76 for 4 experts.
 
-## Setup
+## Reproduce
 
 ```bash
-# 1. Clone
-git clone https://github.com/Levi0p/-moe-ner.git
-cd -moe-ner
-
-# 2. Install dependencies
 pip install -r requirements.txt
-
-# 3. Train both models and compare
-python train.py
-
-# 4. Train only MoE
-python train.py --model moe
-
-# 5. Train only baseline
-python train.py --model base
+python prepare_glove.py            # one-time: GloVe 100d -> glove_vecs.npy, glove_words.txt
+python train.py --models none ffn moe --seeds 0 1 2 --epochs 8
+python train.py --models moe --seeds 0 1 2 --epochs 8 --lb_coef 0.01
 ```
 
-### Optional flags
+Useful flags: `--num_experts`, `--lb_coef`, `--hidden_dim`, `--dropout`, `--device cpu|mps|cuda`. Results are appended to a `.jsonl` file (`--out`), including per-expert routing shares for MoE runs.
 
-```
---epochs       Number of training epochs  (default: 15)
---batch_size   Batch size                 (default: 32)
---lr           Learning rate              (default: 1e-3)
---num_experts  Number of MoE experts      (default: 4)
---top_k        Top-k routing              (default: 2)
-```
+## Files
 
-## Inference
+- `moe_layer.py` - Expert and MoELayer (gating, top-k routing, balance loss, usage stats)
+- `model.py` - NERTagger (embeddings, char-CNN, BiLSTM, optional FFN/MoE block)
+- `dataset.py` - CoNLL-2003 loading, vocab, casing and char features
+- `train.py` - training, whole-split seqeval F1, multi-seed runs
+- `predict.py` - inference on custom text (uses the original pipeline; see note below)
 
-```bash
-python predict.py \
-  --checkpoint checkpoints/moe_best.pt \
-  --text "Sundar Pichai visited New York to meet Microsoft executives."
-```
-
-Output:
-```
-Input : Sundar Pichai visited New York to meet Microsoft executives.
-
-Token                Label
---------------------------------
-Sundar               B-PER       ← ENTITY
-Pichai               I-PER       ← ENTITY
-visited              O
-New                  B-LOC       ← ENTITY
-York                 I-LOC       ← ENTITY
-to                   O
-meet                 O
-Microsoft            B-ORG       ← ENTITY
-executives.          O
-```
-
-## Project Structure
-
-```
--moe-ner/
-├── moe_layer.py   # MoE layer (Expert + MoELayer classes)
-├── model.py       # BiLSTMNER + BiLSTMMoENER
-├── dataset.py     # CoNLL 2003 loader + vocab builder
-├── train.py       # Training loop + evaluation + comparison
-├── predict.py     # Inference on custom text
-├── checkpoints/   # Saved model weights (auto-created)
-├── requirements.txt
-└── README.md
-```
-
-## Dataset
-
-[CoNLL 2003](https://huggingface.co/datasets/conll2003) is loaded automatically via HuggingFace `datasets`. No manual download required.
-
-Labels: `O`, `B-PER`, `I-PER`, `B-ORG`, `I-ORG`, `B-LOC`, `I-LOC`, `B-MISC`, `I-MISC`
-
-## Key Design Choices
-
-- **Word-level tokenisation** (no sub-word) keeps the model simple and interpretable.
-- **Residual + LayerNorm** around MoE prevents representation collapse.
-- **Top-K soft routing** (not hard routing) keeps the gating differentiable throughout training.
-- **seqeval** used for entity-level F1 (span-based, not token-based) — the correct metric for NER.
+> `predict.py` has not yet been updated to the GloVe/char-CNN model above.

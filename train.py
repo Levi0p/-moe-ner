@@ -1,250 +1,118 @@
 """
-Train BiLSTM baseline and BiLSTM+MoE on CoNLL 2003 NER.
-Saves checkpoints and prints per-epoch metrics.
+Train BiLSTM baseline / dense-FFN control / BiLSTM+MoE on CoNLL 2003, over several seeds.
+Entity F1 is computed once over the whole split with seqeval (not averaged over batches).
 
-Usage:
-    python train.py --model moe   # train MoE model
-    python train.py --model base  # train baseline
-    python train.py               # train both and compare
+    python train.py --models none ffn moe --seeds 0 1 2 3 4
 """
 
 import argparse
-import os
-import sys
+import json
+import random
 import time
-from typing import Dict
 
+import numpy as np
 import torch
 import torch.nn as nn
+from seqeval.metrics import f1_score
 from torch.utils.data import DataLoader
-from datasets import load_dataset
 
-# Make src importable when run from project root
-sys.path.insert(0, os.path.dirname(__file__))
-
-from dataset import CoNLL2003Dataset, build_vocab, NUM_LABELS, ID2LABEL
-from model import BiLSTMNER, BiLSTMMoENER
+from dataset import (CoNLL2003Dataset, ID2LABEL, NUM_LABELS, build_embedding_matrix,
+                     build_vocabs, load_conll)
+from model import NERTagger
 
 
-# ──────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────
-CFG = dict(
-    embed_dim=128,
-    hidden_dim=256,
-    num_layers=2,
-    dropout=0.3,
-    num_experts=4,
-    top_k=2,
-    expert_hidden_dim=256,
-    batch_size=32,
-    lr=1e-3,
-    epochs=15,
-    max_len=128,
-    min_freq=1,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    checkpoint_dir="checkpoints",
-)
-
-
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
-
-def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor):
-    """Token-level accuracy and entity-level F1 (seqeval-style, simplified)."""
-    preds = logits.argmax(dim=-1)  # (B, S)
-
-    # Accuracy (ignore padding -100)
-    active = mask.bool()
-    correct = (preds[active] == labels[active]).sum().item()
-    total = active.sum().item()
-    acc = correct / total if total > 0 else 0.0
-
-    # Entity-level F1 using seqeval if available, else skip
-    try:
-        from seqeval.metrics import f1_score, classification_report
-        pred_tags, true_tags = [], []
-        for b in range(labels.size(0)):
-            p_seq, t_seq = [], []
-            for s in range(labels.size(1)):
-                if labels[b, s].item() == -100:
-                    continue
-                p_seq.append(ID2LABEL[preds[b, s].item()])
-                t_seq.append(ID2LABEL[labels[b, s].item()])
-            pred_tags.append(p_seq)
-            true_tags.append(t_seq)
-        f1 = f1_score(true_tags, pred_tags)
-    except ImportError:
-        f1 = float("nan")
-
-    return acc, f1
-
-
-def train_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    total_loss, total_acc, steps = 0.0, 0.0, 0
-    for input_ids, labels, mask in loader:
-        input_ids, labels, mask = input_ids.to(device), labels.to(device), mask.to(device)
-        optimizer.zero_grad()
-        logits = model(input_ids, mask)              # (B, S, C)
-        loss = criterion(logits.view(-1, NUM_LABELS), labels.view(-1))
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        acc, _ = compute_metrics(logits.detach(), labels, mask)
-        total_loss += loss.item()
-        total_acc += acc
-        steps += 1
-
-    return total_loss / steps, total_acc / steps
+def set_seed(s):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, device):
     model.eval()
-    total_loss, total_acc, total_f1, steps = 0.0, 0.0, 0.0, 0
-    for input_ids, labels, mask in loader:
-        input_ids, labels, mask = input_ids.to(device), labels.to(device), mask.to(device)
-        logits = model(input_ids, mask)
-        loss = criterion(logits.view(-1, NUM_LABELS), labels.view(-1))
-        acc, f1 = compute_metrics(logits, labels, mask)
-        total_loss += loss.item()
-        total_acc += acc
-        total_f1 += f1 if f1 == f1 else 0.0   # nan guard
-        steps += 1
-
-    return total_loss / steps, total_acc / steps, total_f1 / steps
+    gold, pred, correct, total = [], [], 0, 0
+    for words, cases, chars, labels, mask in loader:
+        words, cases, chars, mask = words.to(device), cases.to(device), chars.to(device), mask.to(device)
+        p = model(words, cases, chars, mask).argmax(-1).cpu()
+        for b in range(labels.size(0)):
+            n = int(mask[b].sum())
+            g = labels[b, :n].tolist(); q = p[b, :n].tolist()
+            gold.append([ID2LABEL[i] for i in g]); pred.append([ID2LABEL[i] for i in q])
+            correct += sum(int(a == c) for a, c in zip(g, q)); total += n
+    return correct / total, f1_score(gold, pred)
 
 
-def run(model_type: str, vocab: Dict, cfg: dict):
-    device = cfg["device"]
-    print(f"\n{'='*60}")
-    print(f"  Training: {model_type.upper()}")
-    print(f"  Device  : {device}")
-    print(f"{'='*60}")
-
-    # Data
-    train_ds = CoNLL2003Dataset("train",      vocab, cfg["max_len"])
-    val_ds   = CoNLL2003Dataset("validation", vocab, cfg["max_len"])
-    test_ds  = CoNLL2003Dataset("test",       vocab, cfg["max_len"])
-
-    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
-                              collate_fn=train_ds.collate_fn, num_workers=2)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
-                              collate_fn=val_ds.collate_fn,   num_workers=2)
-    test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False,
-                              collate_fn=test_ds.collate_fn,  num_workers=2)
-
-    # Model
-    vocab_size = len(vocab)
-    if model_type == "base":
-        model = BiLSTMNER(
-            vocab_size=vocab_size,
-            embed_dim=cfg["embed_dim"],
-            hidden_dim=cfg["hidden_dim"],
-            num_labels=NUM_LABELS,
-            num_layers=cfg["num_layers"],
-            dropout=cfg["dropout"],
-        )
-    else:
-        model = BiLSTMMoENER(
-            vocab_size=vocab_size,
-            embed_dim=cfg["embed_dim"],
-            hidden_dim=cfg["hidden_dim"],
-            num_labels=NUM_LABELS,
-            num_experts=cfg["num_experts"],
-            top_k=cfg["top_k"],
-            expert_hidden_dim=cfg["expert_hidden_dim"],
-            num_layers=cfg["num_layers"],
-            dropout=cfg["dropout"],
-        )
-    model = model.to(device)
+def run(head, seed, data, args, device):
+    set_seed(seed)
+    emb, n_chars, train_ds, val_ds, test_ds = data
+    mk = lambda ds, sh: DataLoader(ds, batch_size=args.batch_size, shuffle=sh, collate_fn=ds.collate_fn)
+    tr, va, te = mk(train_ds, True), mk(val_ds, False), mk(test_ds, False)
+    model = NERTagger(emb, n_chars, NUM_LABELS, head=head, hidden_dim=args.hidden_dim,
+                      dropout=args.dropout, num_experts=args.num_experts).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters: {n_params:,}")
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-    best_val_f1, best_state = 0.0, None
-    for epoch in range(1, cfg["epochs"] + 1):
-        t0 = time.time()
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_acc, val_f1 = evaluate(model, val_loader, criterion, device)
-        scheduler.step(val_loss)
-        elapsed = time.time() - t0
-
-        print(
-            f"  Ep {epoch:02d}/{cfg['epochs']}  "
-            f"tr_loss={tr_loss:.4f}  tr_acc={tr_acc:.4f}  "
-            f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}  "
-            f"val_f1={val_f1:.4f}  ({elapsed:.1f}s)"
-        )
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    # Test on best checkpoint
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", patience=2, factor=0.5)
+    crit = nn.CrossEntropyLoss(ignore_index=-100)
+    best_f1, best_state = -1.0, None
+    for ep in range(1, args.epochs + 1):
+        model.train(); t0 = time.time(); tot = 0.0
+        for words, cases, chars, labels, mask in tr:
+            words, cases, chars, labels, mask = [t.to(device) for t in (words, cases, chars, labels, mask)]
+            opt.zero_grad()
+            loss = crit(model(words, cases, chars, mask).view(-1, NUM_LABELS), labels.view(-1))
+            if head == "moe" and args.lb_coef > 0:
+                loss = loss + args.lb_coef * model.block.aux_loss
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step(); tot += loss.item()
+        v_acc, v_f1 = evaluate(model, va, device)
+        sched.step(v_f1)
+        print(f"  [{head} s{seed}] ep{ep:02d} loss={tot/len(tr):.4f} val_acc={v_acc:.4f} val_f1={v_f1:.4f} ({time.time()-t0:.0f}s)", flush=True)
+        if v_f1 > best_f1:
+            best_f1, best_state = v_f1, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
-    model = model.to(device)
-    _, test_acc, test_f1 = evaluate(model, test_loader, criterion, device)
-    print(f"\n  ✅ Test Accuracy : {test_acc:.4f}")
-    print(f"  ✅ Test F1       : {test_f1:.4f}")
-
-    # Save
-    os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
-    ckpt_path = os.path.join(cfg["checkpoint_dir"], f"{model_type}_best.pt")
-    torch.save({"model_state": best_state, "vocab": vocab, "cfg": cfg}, ckpt_path)
-    print(f"  💾 Saved → {ckpt_path}")
-
-    return test_acc, test_f1
+    t_acc, t_f1 = evaluate(model, te, device)
+    usage = None
+    if head == "moe":  # share of top-k routing assignments per expert on the test set
+        model.eval(); acc_u, n = torch.zeros(args.num_experts), 0
+        with torch.no_grad():
+            for words, cases, chars, labels, mask in te:
+                model(words.to(device), cases.to(device), chars.to(device), mask.to(device))
+                acc_u += model.block.last_usage.cpu(); n += 1
+        usage = [round(v, 3) for v in (acc_u / n).tolist()]
+    print(f"==> {head} seed={seed} lb={args.lb_coef if head == 'moe' else '-'} params={n_params:,} val_f1={best_f1:.4f} test_acc={t_acc:.4f} test_f1={t_f1:.4f} usage={usage}", flush=True)
+    return dict(head=head, seed=seed, lb_coef=args.lb_coef if head == "moe" else None, params=n_params,
+                val_f1=best_f1, test_acc=t_acc, test_f1=t_f1, expert_usage=usage)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["base", "moe", "both"], default="both")
-    parser.add_argument("--epochs", type=int, default=CFG["epochs"])
-    parser.add_argument("--batch_size", type=int, default=CFG["batch_size"])
-    parser.add_argument("--lr", type=float, default=CFG["lr"])
-    parser.add_argument("--num_experts", type=int, default=CFG["num_experts"])
-    parser.add_argument("--top_k", type=int, default=CFG["top_k"])
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--models", nargs="+", default=["none", "ffn", "moe"])
+    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--hidden_dim", type=int, default=512)
+    ap.add_argument("--dropout", type=float, default=0.5)
+    ap.add_argument("--lb_coef", type=float, default=0.0, help="MoE load-balancing loss weight (0 = off)")
+    ap.add_argument("--num_experts", type=int, default=4)
+    ap.add_argument("--glove_dir", default="..")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--out", default="results.jsonl")
+    args = ap.parse_args()
 
-    CFG.update(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        num_experts=args.num_experts,
-        top_k=args.top_k,
-    )
+    raw = load_conll()
+    words = open(f"{args.glove_dir}/glove_words.txt").read().split("\n")
+    vecs = np.load(f"{args.glove_dir}/glove_vecs.npy")
+    w2i, c2i = build_vocabs(raw, words)
+    emb, hit = build_embedding_matrix(w2i, words, vecs)
+    print(f"word vocab {len(w2i):,} (GloVe hits {hit:,}), char vocab {len(c2i)}", flush=True)
+    sp = lambda name, tr, wd=0.0: CoNLL2003Dataset(raw[name], w2i, c2i, train=tr, word_dropout=wd)
+    data = (emb, len(c2i), sp("train", True, 0.05), sp("validation", False), sp("test", False))
 
-    print("Loading CoNLL 2003 and building vocabulary …")
-    raw = load_dataset("conll2003", revision="refs/convert/parquet")
-    vocab = build_vocab(raw, min_freq=CFG["min_freq"])
-    print(f"Vocabulary size: {len(vocab):,}")
-
-    results = {}
-    models_to_run = ["base", "moe"] if args.model == "both" else [args.model]
-    for m in models_to_run:
-        acc, f1 = run(m, vocab, CFG)
-        results[m] = {"acc": acc, "f1": f1}
-
-    if args.model == "both":
-        print("\n" + "=" * 60)
-        print("  FINAL COMPARISON")
-        print("=" * 60)
-        base_acc = results["base"]["acc"]
-        moe_acc  = results["moe"]["acc"]
-        base_f1  = results["base"]["f1"]
-        moe_f1   = results["moe"]["f1"]
-        print(f"  {'Model':<12} {'Accuracy':>10} {'F1':>10}")
-        print(f"  {'-'*34}")
-        print(f"  {'BiLSTM':<12} {base_acc:>10.4f} {base_f1:>10.4f}")
-        print(f"  {'BiLSTM+MoE':<12} {moe_acc:>10.4f} {moe_f1:>10.4f}")
-        print(f"  {'Δ (MoE-Base)':<12} {moe_acc-base_acc:>+10.4f} {moe_f1-base_f1:>+10.4f}")
+    for seed in args.seeds:
+        for head in args.models:
+            r = run(head, seed, data, args, args.device)
+            with open(args.out, "a") as f:
+                f.write(json.dumps(r) + "\n")
 
 
 if __name__ == "__main__":

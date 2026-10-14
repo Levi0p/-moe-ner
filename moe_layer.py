@@ -58,10 +58,11 @@ class MoELayer(nn.Module):
         # Gating network: maps input to a distribution over experts
         self.gate = nn.Linear(input_dim, num_experts, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, input_dim)
+            mask: (batch, seq_len), 1 for real tokens; pads are excluded from routing statistics
         Returns:
             out: (batch, seq_len, output_dim)
         """
@@ -74,6 +75,16 @@ class MoELayer(nn.Module):
 
         # Top-k selection
         top_k_scores, top_k_indices = gate_scores.topk(self.top_k, dim=-1)  # (B*S, top_k)
+
+        # Routing statistics over real tokens only (Switch-style balance loss: N * sum_i f_i * P_i)
+        real = (mask.reshape(-1).bool() if mask is not None
+                else torch.ones(B * S, dtype=torch.bool, device=x.device))
+        assign = F.one_hot(top_k_indices, self.num_experts).sum(1).float()   # (B*S, N)
+        f = assign[real].mean(0) / self.top_k                    # fraction of assignments per expert
+        P = gate_scores[real].mean(0)                            # mean gate probability per expert
+        self.aux_loss = self.num_experts * (f.detach() * P).sum()
+        self.last_usage = f.detach()
+
         top_k_scores = top_k_scores / top_k_scores.sum(dim=-1, keepdim=True)  # renormalise
 
         # Compute all expert outputs, then select
