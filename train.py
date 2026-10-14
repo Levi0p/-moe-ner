@@ -7,6 +7,7 @@ Entity F1 is computed once over the whole split with seqeval (not averaged over 
 
 import argparse
 import json
+import os
 import random
 import time
 
@@ -42,7 +43,7 @@ def evaluate(model, loader, device):
 
 def run(head, seed, data, args, device):
     set_seed(seed)
-    emb, n_chars, train_ds, val_ds, test_ds = data
+    emb, n_chars, train_ds, val_ds, test_ds, w2i, c2i = data
     mk = lambda ds, sh: DataLoader(ds, batch_size=args.batch_size, shuffle=sh, collate_fn=ds.collate_fn)
     tr, va, te = mk(train_ds, True), mk(val_ds, False), mk(test_ds, False)
     model = NERTagger(emb, n_chars, NUM_LABELS, head=head, hidden_dim=args.hidden_dim,
@@ -70,6 +71,10 @@ def run(head, seed, data, args, device):
             best_f1, best_state = v_f1, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     model.load_state_dict(best_state)
     t_acc, t_f1 = evaluate(model, te, device)
+    os.makedirs(args.save_dir, exist_ok=True)
+    torch.save({"model_state": best_state, "head": head, "word2id": w2i, "char2id": c2i,
+                "emb_dim": emb.size(1), "hidden_dim": args.hidden_dim, "num_experts": args.num_experts},
+               os.path.join(args.save_dir, f"{head}_seed{seed}.pt"))
     usage = None
     if head == "moe":  # share of top-k routing assignments per expert on the test set
         model.eval(); acc_u, n = torch.zeros(args.num_experts), 0
@@ -97,6 +102,7 @@ def main():
     ap.add_argument("--glove_dir", default="..")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default="results.jsonl")
+    ap.add_argument("--save_dir", default="checkpoints")
     args = ap.parse_args()
 
     raw = load_conll()
@@ -106,7 +112,7 @@ def main():
     emb, hit = build_embedding_matrix(w2i, words, vecs)
     print(f"word vocab {len(w2i):,} (GloVe hits {hit:,}), char vocab {len(c2i)}", flush=True)
     sp = lambda name, tr, wd=0.0: CoNLL2003Dataset(raw[name], w2i, c2i, train=tr, word_dropout=wd)
-    data = (emb, len(c2i), sp("train", True, 0.05), sp("validation", False), sp("test", False))
+    data = (emb, len(c2i), sp("train", True, 0.05), sp("validation", False), sp("test", False), w2i, c2i)
 
     for seed in args.seeds:
         for head in args.models:

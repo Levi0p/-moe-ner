@@ -49,7 +49,14 @@ Useful flags: `--num_experts`, `--lb_coef`, `--hidden_dim`, `--dropout`, `--devi
 - `moe_layer.py` - Expert and MoELayer (gating, top-k routing, balance loss, usage stats)
 - `model.py` - NERTagger (embeddings, char-CNN, BiLSTM, optional FFN/MoE block)
 - `dataset.py` - CoNLL-2003 loading, vocab, casing and char features
-- `train.py` - training, whole-split seqeval F1, multi-seed runs
-- `predict.py` - inference on custom text (uses the original pipeline; see note below)
+- `train.py` - training, whole-split seqeval F1, multi-seed runs; saves the best checkpoint to `checkpoints/<model>_seed<N>.pt` (`--save_dir`)
+- `predict.py` - tag your own text with a saved checkpoint
 
-> `predict.py` has not yet been updated to the GloVe/char-CNN model above.
+## Try it on your own text
+
+```bash
+python train.py --models moe --seeds 0 --epochs 8 --lb_coef 0.01   # writes checkpoints/moe_seed0.pt
+python predict.py --checkpoint checkpoints/moe_seed0.pt --text "Barack Obama visited London last week ."
+```
+
+Limitation: the word vocabulary only contains words seen in CoNLL-2003 (plus GloVe words that appear in it), so names that never occur in that data fall back to `<UNK>` and rely on casing and character features. Expect weaker results on modern names than on CoNLL-style news text.
